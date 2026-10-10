@@ -1,112 +1,188 @@
 # Revisão de vídeo
 
-API HTTP para campanhas, entregas e versões de roteiro, vídeo, capa e legenda. O upload é representado por uma URL ou nome de arquivo; nenhum arquivo é transferido ou processado.
+[![CI](https://github.com/leonardoperin14/conty-challenge-08-video/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/leonardoperin14/conty-challenge-08-video/actions/workflows/ci.yml)
 
-## Requisitos e execução
+API para revisar entregas de criadores, com versões de roteiro, vídeo, capa e legenda. Cada campanha define suas peças obrigatórias. A entrega só pode ser aprovada quando a versão atual de cada peça exigida estiver aprovada.
 
-Requer Node.js 24 ou mais recente e npm.
+**TypeScript · Node.js 24+ · Hono · SQLite · Vitest**
 
-~~~sh
+O envio de conteúdo é representado por uma URL ou nome de arquivo fictício; a API não transfere nem processa arquivos.
+
+## Execução
+
+```bash
 npm ci
 npm run dev
-~~~
+```
 
-O servidor escuta em http://localhost:3000. O banco SQLite padrão fica em data/conty.sqlite; PORT e DATABASE_PATH podem ser definidos no ambiente.
+A API inicia em `http://localhost:3000` e usa `data/conty.sqlite`. `PORT` e `DATABASE_PATH` alteram essas configurações.
 
-Comandos disponíveis:
-
-~~~sh
-npm run build
-npm run typecheck
+```bash
 npm test
+npm run typecheck
+npm run build
 npm start
-~~~
+```
 
-## Regra de aprovação
+`npm test` compila o projeto antes de executar a suíte. O CI executa instalação, testes, typecheck e build em Ubuntu com Node.js 24, a cada push ou pull request. Nesta atualização documental, esses comandos não foram executados novamente.
 
-Cada campanha exige ao menos uma peça, escolhida entre SCRIPT, VIDEO, COVER e CAPTION. Uma campanha que exige somente VIDEO não exige roteiro. As peças exigidas ficam bloqueadas depois da primeira entrega.
+## Fluxo de aprovação
 
-A entrega só pode receber aprovação final quando a versão atual de cada peça exigida estiver aprovada. A API salva os IDs dessas versões na aprovação.
+```mermaid
+flowchart TB
+    C["Campanha define as peças obrigatórias"] --> D["Criador recebe uma entrega"]
+    D --> V["Envia uma versão de cada peça"]
+    V --> R["Revisa e aprova as versões atuais"]
+    R --> Q{"Todas as peças obrigatórias estão aprovadas?"}
+    Q -->|Não| P["IN_PRODUCTION<br/>Aprovação final retorna 409 com pendências"]
+    Q -->|Sim| Ready["READY_FOR_APPROVAL"]
+    Ready --> Final["Aprovação explícita da entrega"]
+    Final --> Approved["APPROVED<br/>Registra os IDs das versões aprovadas"]
+    Approved -->|Nova versão obrigatória| New["Invalida a aprovação final<br/>Nova versão começa SUBMITTED"]
+    New --> R
 
-Quando uma peça exigida recebe uma versão nova, a aprovação final anterior é invalidada na mesma transação. A versão nova começa como SUBMITTED; a entrega fica IN_PRODUCTION até essa versão ser aprovada. Depois disso, o estado passa a READY_FOR_APPROVAL. É necessária outra chamada explícita a POST /deliveries/:id/approve para aprovar a entrega; aprovar a versão da peça nunca reaproveita nem recria a aprovação final automaticamente.
+    classDef state fill:#eaf2fb,stroke:#50739b,color:#172b4d;
+    class P,Ready,Approved,New state;
+```
 
-Uma peça opcional não bloqueia a entrega. Nesta implementação, uma versão nova de peça opcional também não invalida a aprovação final; essa é a interpretação adotada para a ambiguidade registrada na revisão.
+A política está centralizada em [`src/approval-policy.ts`](src/approval-policy.ts). Ela recebe as peças exigidas pela campanha e as versões atuais; não depende de condições fixas como “toda entrega exige roteiro”. O [`DeliveryService`](src/delivery-service.ts) aplica essa política às operações e grava o histórico em transações SQLite.
 
-## Exemplo
+## Peças exigidas pela campanha
 
-Crie uma campanha que exige somente vídeo:
+`required_pieces` aceita uma lista sem repetições, com pelo menos um dos tipos:
 
-~~~http
-POST /campaigns
-Content-Type: application/json
+| Tipo | Peça |
+| --- | --- |
+| `SCRIPT` | Roteiro |
+| `VIDEO` | Vídeo |
+| `COVER` | Capa |
+| `CAPTION` | Legenda |
 
-{"name":"Lançamento","required_pieces":["VIDEO"]}
-~~~
+**Uma campanha só de vídeo exige apenas `VIDEO`.** Roteiro, capa e legenda só bloqueiam a aprovação se estiverem na lista. Essa configuração é persistida em `campaign_required_pieces` e pode mudar até a criação da primeira entrega; depois disso, alterações retornam `409 / CAMPAIGN_REQUIREMENTS_LOCKED`.
 
-~~~json
-{
-  "id": "<campaign-id>",
-  "name": "Lançamento",
-  "required_pieces": ["VIDEO"],
-  "created_at": "2026-10-09T12:00:00.000Z"
-}
-~~~
+Se faltar uma peça obrigatória ou sua versão atual ainda não estiver aprovada, a aprovação final retorna HTTP `409`, com as pendências:
 
-Crie uma entrega e envie uma versão por URL ou por nome de arquivo falso:
-
-~~~http
-POST /campaigns/<campaign-id>/deliveries
-Content-Type: application/json
-
-{"creator_id":"creator-1"}
-~~~
-
-~~~http
-POST /deliveries/<delivery-id>/pieces/VIDEO/versions
-Content-Type: application/json
-
-{"content_url":"https://example.test/video-v1.mp4"}
-~~~
-
-A nova versão retorna um ID e estado SUBMITTED. Aprove a versão atual e, em seguida, a entrega:
-
-~~~http
-POST /versions/<version-id>/approve
-POST /deliveries/<delivery-id>/approve
-~~~
-
-Se uma peça obrigatória ainda não tiver uma versão atual aprovada, a aprovação final responde HTTP 409:
-
-~~~json
+```json
 {
   "error": "REQUIRED_PIECES_NOT_APPROVED",
   "message": "A entrega possui peças obrigatórias pendentes.",
   "pending_pieces": ["VIDEO"]
 }
-~~~
+```
 
-Substituir o vídeo depois da aprovação exige aprovar a nova versão e chamar POST /deliveries/<delivery-id>/approve novamente.
+## Exemplo: campanha só de vídeo
+
+Crie a campanha e use o `id` retornado no próximo comando:
+
+```bash
+curl -X POST http://localhost:3000/campaigns \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Lançamento","required_pieces":["VIDEO"]}'
+
+curl -X POST http://localhost:3000/campaigns/CAMPAIGN_ID/deliveries \
+  -H 'Content-Type: application/json' \
+  -d '{"creator_id":"creator-1"}'
+```
+
+Use o ID da entrega para criar uma versão. O corpo aceita `content_url` ou `file_name`:
+
+```bash
+curl -X POST http://localhost:3000/deliveries/DELIVERY_ID/pieces/VIDEO/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"content_url":"https://example.test/video-v1.mp4"}'
+```
+
+A versão começa como `SUBMITTED`. Aprove-a usando seu `id` e depois aprove a entrega:
+
+```bash
+curl -X POST http://localhost:3000/versions/VERSION_ID/approve
+curl -X POST http://localhost:3000/deliveries/DELIVERY_ID/approve
+curl http://localhost:3000/deliveries/DELIVERY_ID
+```
+
+A consulta mostra `required_pieces`, `pending_pieces`, versões de cada peça e `approval_history`, incluindo quais versões foram aprovadas em cada ocasião.
+
+## Uma versão nova substitui a anterior
+
+A versão atual é a de maior `version_number` daquela peça na entrega. A anterior permanece no histórico com `is_current: false`; seu conteúdo não é sobrescrito. Tentar aprovar uma versão antiga retorna `409 / VERSION_NOT_CURRENT`.
+
+**Uma versão nova de peça obrigatória desfaz a aprovação final na mesma transação.** Exemplo para uma campanha que exige somente vídeo:
+
+| Ação | Vídeo atual | Estado da entrega |
+| --- | --- | --- |
+| Aprovar vídeo v1 e depois a entrega | v1 `APPROVED` | `APPROVED` |
+| Enviar vídeo v2 | v2 `SUBMITTED` | `IN_PRODUCTION` |
+| Aprovar vídeo v2 | v2 `APPROVED` | `READY_FOR_APPROVAL` |
+| Aprovar a entrega novamente | v2 `APPROVED` | `APPROVED` |
+
+Aprovar a peça não aprova automaticamente a entrega. A aprovação anterior fica no histórico com `invalidated_at` e os IDs antigos; a nova aprovação registra as versões atuais.
+
+Peças opcionais não bloqueiam a entrega. Nesta implementação, uma nova versão opcional também não invalida a aprovação final: a aprovação cobre as peças obrigatórias da campanha. Essa é a interpretação adotada para esse caso.
+
+## Comentário preso à versão e ao segundo
+
+O comentário pertence ao `version_id` exato do vídeo. Exemplo no segundo 15 da v1:
+
+```bash
+curl -X POST http://localhost:3000/versions/VIDEO_V1_ID/comments \
+  -H 'Content-Type: application/json' \
+  -d '{"second":15,"text":"Ajustar o corte."}'
+
+curl http://localhost:3000/versions/VIDEO_V1_ID/comments
+```
+
+Trecho da resposta de consulta:
+
+```json
+{
+  "version_id": "VIDEO_V1_ID",
+  "comments": [
+    {
+      "id": "COMMENT_ID",
+      "version_id": "VIDEO_V1_ID",
+      "second": 15,
+      "text": "Ajustar o corte.",
+      "created_at": "2026-10-10T12:00:00.000Z"
+    }
+  ]
+}
+```
+
+**O comentário não migra para a v2.** Depois de enviar outra versão, a consulta da v1 continua mostrando o comentário e a da v2 retorna `comments: []`, até receber seus próprios comentários. O segundo aceita números finitos e não negativos, inclusive fracionários. Comentários com tempo são permitidos apenas em peças `VIDEO`.
 
 ## Rotas
 
-| Método e caminho | Operação |
-|---|---|
-| POST /campaigns | Criar campanha e declarar required_pieces |
-| GET /campaigns/:id | Consultar campanha e peças exigidas |
-| PUT /campaigns/:id/required-pieces | Alterar exigências antes da primeira entrega |
-| POST /campaigns/:id/deliveries | Criar entrega |
-| POST /deliveries/:id/pieces/:type/versions | Criar versão por URL ou nome de arquivo |
-| POST /versions/:id/approve | Aprovar a versão atual |
-| POST /deliveries/:id/approve | Aprovar explicitamente as versões atuais exigidas |
-| POST /versions/:id/comments | Comentar em um segundo de uma versão de vídeo |
-| GET /deliveries/:id, /versions/:id/comments | Consultar estado, histórico e comentários |
+| Método | Rota | Descrição |
+| --- | --- | --- |
+| `POST` / `GET` | `/campaigns` / `/campaigns/:id` | Criar e consultar campanha |
+| `PUT` | `/campaigns/:id/required-pieces` | Alterar exigências antes da primeira entrega |
+| `POST` | `/campaigns/:id/deliveries` | Criar entrega |
+| `GET` | `/deliveries/:id` | Consultar estado e histórico |
+| `POST` | `/deliveries/:id/pieces/:type/versions` | Enviar uma nova versão |
+| `GET` | `/versions/:id` | Consultar uma versão |
+| `POST` | `/versions/:id/approve` | Aprovar a versão atual |
+| `POST` | `/deliveries/:id/approve` | Aprovar a entrega |
+| `POST` / `GET` | `/versions/:id/comments` | Criar e consultar comentários da versão |
 
-Comentários pertencem ao ID exato da versão de vídeo e não são copiados para versões seguintes. O segundo precisa ser finito e não negativo.
+## Testes
+
+| Regra | Evidência existente |
+| --- | --- |
+| Peça obrigatória ausente ou pendente bloqueia aprovação | Testes da política e da API verificam pendências e erro `409` |
+| Campanha só de vídeo dispensa roteiro | Teste aprova a entrega com apenas `VIDEO` |
+| Nova versão obrigatória invalida entrega aprovada | Teste preserva a v1, invalida a aprovação e exige aprovar v2 e entrega novamente |
+| Comentário permanece na versão original | Teste cria comentário no segundo 15 da v1 e verifica v2 sem comentários |
+| Exigências são dados da campanha | Testes usam diferentes listas e verificam bloqueio de alteração após a primeira entrega |
+| Operações concorrentes preservam consistência | Testes verificam versões sequenciais únicas e aprovação concorrente com substituição |
+
+Os testes estão em [`test/approval-policy.test.ts`](test/approval-policy.test.ts), [`test/api.test.ts`](test/api.test.ts) e [`test/concurrency.test.ts`](test/concurrency.test.ts).
 
 ## Limitações
 
-A API não autentica usuários, transfere arquivos, inspeciona URLs, valida a duração real dos vídeos nem integra pagamentos. A persistência SQLite serve ao desafio local; uma implantação de alto volume ou distribuída precisaria de outra estratégia.
+Não há autenticação, transferência de arquivos, inspeção de URLs, validação da duração real do vídeo ou integração de pagamentos. O segundo de um comentário não é comparado com a duração do arquivo. O SQLite atende à execução local; uma implantação distribuída precisaria reavaliar a persistência.
 
 ## Uso de IA e revisão
 
-Codex escreveu a implementação, os testes e esta documentação. Outra sessão do Codex fez revisão técnica somente leitura, não confirmou defeito funcional e registrou a ambiguidade das peças opcionais, descrita acima. Na preparação, a pessoa responsável filtrou instruções externas ao escopo, definiu critérios e checkpoints, acompanhou as evidências e autorizou a publicação; isso não declara revisão humana linha a linha do código.
+Usei o Codex para implementar a API, a política de aprovação, a persistência, os testes e a documentação. Uma segunda sessão fez a revisão técnica e apontou a ambiguidade sobre versões de peças opcionais, cuja decisão está descrita neste README.
+
+Minha participação foi definir o escopo e os checkpoints, acompanhar as evidências e autorizar a publicação. A implementação e a revisão técnica foram feitas com IA; não fiz revisão humana linha a linha do código. Esta atualização do README também foi preparada com esse apoio.
